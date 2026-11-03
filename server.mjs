@@ -1,11 +1,27 @@
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
+import { readFileSync } from 'node:fs';
 
 class BridgeError extends Error {
   constructor(status, message) { super(message); this.status = status; }
 }
 const failure = (status, message) => new BridgeError(status, message);
+
+// 两端版本互查：node 端版本取自 package.json，插件版本由连接时上报
+const SERVER_VERSION = (() => {
+  try { return JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version || '0.0.0'; } catch { return '0.0.0'; }
+})();
+const MIN_BRIDGE_VERSION = SERVER_VERSION;
+export function compareVersion(a, b) {
+  const parts = value => String(value || '').split(/[^\d]+/).filter(Boolean).map(Number);
+  const left = parts(a), right = parts(b);
+  for (let i = 0; i < Math.max(left.length, right.length); i++) {
+    const x = left[i] || 0, y = right[i] || 0;
+    if (x !== y) return x - y;
+  }
+  return 0;
+}
 
 function buildPrompt(input) {
   // 用自然语言提问：正常对话里没人会贴 JSON 和任务编号，那种格式本身就是一个明显的机器特征
@@ -288,8 +304,8 @@ export function createServer({ token, monitorIntervalMs = 250, apiSolver = null,
       }
       if (requestPath === '/health' && req.method === 'GET') {
         return reply(200, apiSolver
-          ? { status: 'ok', mode: 'deepseek-api', connected: true, queued: 0 }
-          : { status: 'ok', mode: 'web-bridge', ...queue.status() });
+          ? { status: 'ok', mode: 'deepseek-api', connected: true, queued: 0, serverVersion: SERVER_VERSION }
+          : { status: 'ok', mode: 'web-bridge', serverVersion: SERVER_VERSION, ...queue.status() });
       }
       if (!routes.has(requestPath)) throw failure(404, '接口不存在');
       if (apiSolver && requestPath !== '/search') throw failure(404, '当前 API 模式不启用网页桥接接口');
@@ -335,7 +351,10 @@ export function createServer({ token, monitorIntervalMs = 250, apiSolver = null,
       if (requestPath === '/bridge/connect') {
         queue.connect(clientId);
         const version = typeof body.version === 'string' ? body.version.slice(0, 20) : '';
-        return reply(200, { code: 0, message: version ? `桥接脚本 v${version}` : '' });
+        const outdated = version ? compareVersion(version, MIN_BRIDGE_VERSION) < 0 : false;
+        if (outdated) logger(`${clock(new Date())} ⚠ 桥接脚本 v${version} 低于建议版本 v${MIN_BRIDGE_VERSION}，请更新油猴脚本`);
+        return reply(200, { code: 0, message: version ? `桥接脚本 v${version}` : '',
+          serverVersion: SERVER_VERSION, minBridgeVersion: MIN_BRIDGE_VERSION, bridgeOutdated: outdated });
       }
       if (requestPath === '/bridge/heartbeat') queue.touch(clientId);
       if (requestPath === '/bridge/poll') {

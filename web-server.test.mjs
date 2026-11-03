@@ -74,7 +74,8 @@ test('DeepSeek API backend answers OCS search without a browser bridge', async t
   } });
   const { base, post } = await fixture(t, { apiSolver });
   const health = await (await fetch(base + '/health')).json();
-  assert.deepEqual(health, { status: 'ok', mode: 'deepseek-api', connected: true, queued: 0 });
+  assert.deepEqual(health, { status: 'ok', mode: 'deepseek-api', connected: true, queued: 0, serverVersion: health.serverVersion });
+  assert.match(health.serverVersion, /^\d+\.\d+\.\d+/);
   assert.equal((await post('/bridge/connect', { clientId: 'unused' })).status, 404);
   const response = await post('/search', question);
   assert.equal(response.status, 200);
@@ -240,4 +241,13 @@ test('downloads images embedded in the question and serves them back as blobs', 
   assert.equal((await blob.arrayBuffer()).byteLength, png.length);
   await call('/bridge/result', { id: job.id, answer: answer(job.id) });
   assert.equal((await waiting).status, 200);
+});
+test('reports both versions so each side can check the other', async t => {
+  const pkg = JSON.parse(await readFile(new URL('./package.json', import.meta.url), 'utf8'));
+  const { base, call } = await fixture(t);
+  assert.equal((await (await fetch(base + '/health')).json()).serverVersion, pkg.version);
+  const info = await call('/bridge/connect', { version: '1.0.0' });
+  assert.equal(info.serverVersion, pkg.version);
+  assert.equal(info.bridgeOutdated, true);
+  assert.ok(info.minBridgeVersion);
 });

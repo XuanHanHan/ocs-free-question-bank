@@ -4,7 +4,7 @@
 // @author       XuanHanHan（原作者）、42419（fork 维护）
 // @homepageURL  https://github.com/XuanHanHan/ocs-free-question-bank
 // @source       https://github.com/XuanHanHan/ocs-free-question-bank
-// @version      1.12.1
+// @version      1.13.0
 // @description  在已登录的 DeepSeek 网页处理本机 OCS 题目，无需 DeepSeek API 密钥
 // @match        https://chat.deepseek.com/*
 // @grant        GM_xmlhttpRequest
@@ -109,6 +109,20 @@
     const explanation = before.slice(0, 12000) || '来自 DeepSeek 网页回答';
     return { answers, explanation };
   }
+  // 两端用同一套版本号：与 package.json 和脚本头部的 @version 保持一致（改的时候三处一起改）
+  const VERSION = '1.13.0';
+  /** 版本比较：两端互查时用，缺省段按 0 处理 */
+  function compareVersion(a, b) {
+    const parts = value => String(value || '').split(/[^\d]+/).filter(Boolean).map(Number);
+    const left = parts(a), right = parts(b);
+    for (let i = 0; i < Math.max(left.length, right.length); i++) {
+      const x = left[i] || 0, y = right[i] || 0;
+      if (x !== y) return x - y;
+    }
+    return 0;
+  }
+  // node 端至少要是这个版本，缺了 /blob、body.token 等能力会静默降级
+  const MIN_SERVER_VERSION = VERSION;
   // 人工节奏参数：DeepSeek 对短时间内连续提问会触发风控，这里把整套动作放慢；需要更慢/更快直接改这些数
   const PACE = {
     beforeType: [600, 1400],    // 敲字前的停顿（毫秒）
@@ -265,12 +279,11 @@
   }
   // Node's tests import pure protocol/runner helpers; the installed userscript runs below.
   if (typeof module === 'object' && module.exports) {
-    module.exports = { parseAnswer, splitAnswers, runJob, createDomAdapter, selectors };
+    module.exports = { parseAnswer, splitAnswers, compareVersion, runJob, createDomAdapter, selectors };
     return;
   }
 
   const clientId = crypto.randomUUID();
-  const VERSION = '1.12.1';
   const ui = createDomAdapter(document);
   let active = false, loop = null, heartbeat = null, heartbeatBusy = false, registered = false, stopping = null, epoch = 0, answered = 0;
   let address = GM_getValue('address', 'http://127.0.0.1:3000');
@@ -318,7 +331,7 @@
     section.collapsed #body,section.collapsed #cfg{display:none}
     section.collapsed .ver{display:none}
     section.collapsed header{border-bottom:0;padding:3px 4px 3px 10px}
-    </style><section id="panel"><header id="bar" title="拖动可移动"><strong>OCS 桥接</strong><span class="ver">v1.12.1</span><span id="dot" data-tone="idle"></span><button id="cfg" title="服务地址与口令">⚙</button><button id="fold" title="收起">−</button></header>
+    </style><section id="panel"><header id="bar" title="拖动可移动"><strong>OCS 桥接</strong><span class="ver">v${VERSION}</span><span id="dot" data-tone="idle"></span><button id="cfg" title="服务地址与口令">⚙</button><button id="fold" title="收起">−</button></header>
     <div id="body">
     <div class="row"><button id="start" title="开始领取 OCS 题目">启动</button><button id="pause" disabled title="停止领取任务并取消队列">暂停</button></div>
     <p id="status">请登录并打开一个专用空白对话，然后启动。</p>
@@ -495,12 +508,18 @@
         if (ui.draft().trim() || !ui.isIdle()) throw new Error('请清空草稿并等待当前回答完成，再启动');
         GM_setValue('address', address);
         GM_setValue('token', token);
-        await request('/bridge/connect', { version: VERSION });
-        console.log(`[OCS bridge] 已连接，传输方式：${transport}`);
+        const info = await request('/bridge/connect', { version: VERSION });
+        const serverVersion = typeof info.serverVersion === 'string' ? info.serverVersion : '';
+        const serverOutdated = serverVersion ? compareVersion(serverVersion, MIN_SERVER_VERSION) < 0 : false;
+        console.log(`[OCS bridge] 已连接，传输方式：${transport}；插件 v${VERSION}，node v${serverVersion || '未知'}`);
+        if (serverOutdated) console.warn(`[OCS bridge] node 端 v${serverVersion} 低于所需的 v${MIN_SERVER_VERSION}，图片上传等能力会降级`);
+        if (info.bridgeOutdated) console.warn('[OCS bridge] 服务端提示插件版本偏旧，建议更新油猴脚本');
         registered = active = true;
         pause.disabled = false;
         settings.hidden = true;
-        display(`已连接，等待 OCS 题目。（${transport}）`, 'ok');
+        display(serverOutdated
+          ? `⚠️ node 端 v${serverVersion} 过旧（需要 v${MIN_SERVER_VERSION}），请更新仓库后重启服务`
+          : `已连接（插件 v${VERSION} / node v${serverVersion || '未知'}）`, serverOutdated ? 'error' : 'ok');
         heartbeat = setInterval(async () => {
           if (heartbeatBusy || !active) return;
           heartbeatBusy = true;

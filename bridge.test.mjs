@@ -31,6 +31,12 @@ test('subjective prose answers and bracket notes are handled', { skip: !bridge.p
   // 答案后面跟了第二句，不该混进答案
   assert.deepEqual(bridge.parseAnswer('答案：A、C。解析略', 'multiple').answers, ['A', 'C']);
 });
+test('compares versions for the two-way check', { skip: !bridge.compareVersion }, () => {
+  assert.equal(bridge.compareVersion('1.2.0', '1.2.0'), 0);
+  assert.ok(bridge.compareVersion('1.10.0', '1.9.0') > 0);
+  assert.ok(bridge.compareVersion('1.9.9', '1.10.0') < 0);
+  assert.ok(bridge.compareVersion('', '1.0.0') < 0);
+});
 test('explanation comes from the text before the answer line', { skip: !bridge.parseAnswer }, () => {
   assert.deepEqual(bridge.parseAnswer('2 和 3 是质数。\n答案：2、3'),
     { answers: ['2', '3'], explanation: '2 和 3 是质数。' });
