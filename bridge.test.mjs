@@ -36,18 +36,21 @@ test('explanation comes from the text before the answer line', { skip: !bridge.p
     { answers: ['2', '3'], explanation: '2 和 3 是质数。' });
 });
 function harness({ draft = '', answerText = '2 和 3 是质数。\n答案：2、3', existing = 0, frozen = false,
-  streaming = false, busyMs = 0, cancel = false } = {}) {
+  virtualized = false, streaming = false, busyMs = 0, cancel = false } = {}) {
   let now = 0, clicks = 0, sentAt = null, text = draft;
   const expected = { bridge_id: 'job-1', answers: ['2', '3'], explanation: '2 和 3 是质数。' };
+  const oldText = '旧题目\n答案：A';
   const ui = {
     draft: () => text,
     isIdle: () => sentAt === null ? now >= busyMs : now >= sentAt + 1000,
     fill: value => { text = value; },
     canSend: () => text.trim().length > 0,
     clickSend: () => { clicks++; text = ''; sentAt = now; },
-    count: () => frozen ? existing : existing + (sentAt === null ? 0 : 1),
+    // virtualized：模拟长对话里消息列表虚拟化 —— 回复条数不涨，但内容会换
+    count: () => (frozen || virtualized) ? existing : existing + (sentAt === null ? 0 : 1),
     replies: () => {
-      if (sentAt === null) return existing ? ['旧题目\n答案：A'] : [];
+      if (sentAt === null) return existing ? [oldText] : [];
+      if (frozen) return [oldText];
       return [streaming ? answerText.slice(0, 6 + ((now - sentAt) % 4)) : answerText];
     },
     url: () => 'https://chat.deepseek.com/a/chat/s/test',
@@ -89,6 +92,12 @@ test('answers that existed before sending and unfinished replies are not accepte
     await assert.rejects(bridge.runJob(job, h.ui, h.options));
     assert.equal(h.clicks(), 1);
   }
+});
+test('accepts the reply even when the message list stops growing', { skip: !bridge.runJob }, async () => {
+  // 长对话里消息列表虚拟化时条数不涨，但最后一条内容会换 —— 必须仍然认出来
+  const h = harness({ virtualized: true, existing: 1 });
+  assert.deepEqual(await bridge.runJob(job, h.ui, h.options), h.expected);
+  assert.equal(h.clicks(), 1);
 });
 test('wait for the page to go idle before sending instead of failing', { skip: !bridge.runJob }, async () => {
   const h = harness({ busyMs: 900 });

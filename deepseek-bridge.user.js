@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OCS DeepSeek 网页桥接
 // @namespace    local.ocs.deepseek.bridge
-// @version      1.11.0
+// @version      1.12.0
 // @description  在已登录的 DeepSeek 网页处理本机 OCS 题目，无需 DeepSeek API 密钥
 // @match        https://chat.deepseek.com/*
 // @grant        GM_xmlhttpRequest
@@ -152,8 +152,9 @@
       if (now() >= idleDeadline) throw new Error('网页仍在生成，等待 60 秒后放弃，请检查网页再重新启动');
       await sleep(150);
     }
-    // 记下当前已有的回复条数，之后只认新增的那条
+    // 记下当前已有的回复条数与最后一条内容，之后用来判断哪条是这一题的新回答
     const baseline = ui.count();
+    const baselineText = ui.replies().slice(-1)[0] || '';
     // 图片先挂上去，上传和打字并行
     if (job.images?.length) await attachImages(job.images);
     if (typing) {
@@ -184,6 +185,7 @@
     }
     check();
     ui.clickSend(); // Never retry a send: an uncertain send pauses the bridge.
+    const sentAt = now();
     const ackDeadline = Math.min(job.deadline, now() + 8000);
     while (ui.draft().trim()) {
       check();
@@ -191,18 +193,28 @@
       await sleep(100);
     }
     const conversationUrl = ui.url();
-    let stableText = '', stableSince = 0;
+    let stableText = '', stableSince = 0, stalled = false;
     while (true) {
       check();
       if (ui.url() !== conversationUrl) throw new Error('对话页面已切换，桥接暂停以避免串题');
-      // 只认发送之后新增的那条回复，避免把上一题的答案当成这一题的
-      const latest = ui.count() > baseline ? ui.replies().slice(-1)[0] : '';
+      // 是不是「这一题的新回复」：条数变多了，或者最后一条内容变了。
+      // 只用条数会在长对话里失灵（消息列表虚拟化/重渲染时段数不涨），表现为答案已出却一直读秒。
+      const replies = ui.replies();
+      const latest = replies.slice(-1)[0] || '';
+      const fresh = ui.count() > baseline || (latest && latest !== baselineText);
       // 只看回复正文是否稳定：网页的“生成中”状态可能比答案晚结束很多（实测 93 秒 vs 3 秒），
       // 不能拿它当回传条件，否则 OCS 会一直转圈。
-      const parsed = latest ? parseAnswer(latest, job.input?.type) : null;
-      if (parsed) {
-        if (latest !== stableText) { stableText = latest; stableSince = now(); }
-        else if (now() - stableSince >= 600) return { bridge_id: job.id, ...parsed };
+      const match = fresh
+        ? replies.map(text => ({ text, value: parseAnswer(text, job.input?.type) })).filter(item => item.value).pop()
+        : null;
+      // 20 秒还没认出来就留一条诊断，方便对着控制台查是哪一半判定失效
+      if (!match && replies.length && !stalled && now() - sentAt > 20000) {
+        stalled = true;
+        console.log(`[OCS bridge] 疑似卡住：条数=${ui.count()} 基线=${baseline} 文本变过=${latest !== baselineText}`);
+      }
+      if (match) {
+        if (match.text !== stableText) { stableText = match.text; stableSince = now(); }
+        else if (now() - stableSince >= 600) return { bridge_id: job.id, ...match.value };
       } else { stableText = ''; }
       await sleep(150);
     }
@@ -252,7 +264,7 @@
   }
 
   const clientId = crypto.randomUUID();
-  const VERSION = '1.11.0';
+  const VERSION = '1.12.0';
   const ui = createDomAdapter(document);
   let active = false, loop = null, heartbeat = null, heartbeatBusy = false, registered = false, stopping = null, epoch = 0, answered = 0;
   let address = GM_getValue('address', 'http://127.0.0.1:3000');
@@ -300,7 +312,7 @@
     section.collapsed #body,section.collapsed #cfg{display:none}
     section.collapsed .ver{display:none}
     section.collapsed header{border-bottom:0;padding:3px 4px 3px 10px}
-    </style><section id="panel"><header id="bar" title="拖动可移动"><strong>OCS 桥接</strong><span class="ver">v1.11</span><span id="dot" data-tone="idle"></span><button id="cfg" title="服务地址与口令">⚙</button><button id="fold" title="收起">−</button></header>
+    </style><section id="panel"><header id="bar" title="拖动可移动"><strong>OCS 桥接</strong><span class="ver">v1.12</span><span id="dot" data-tone="idle"></span><button id="cfg" title="服务地址与口令">⚙</button><button id="fold" title="收起">−</button></header>
     <div id="body">
     <div class="row"><button id="start" title="开始领取 OCS 题目">启动</button><button id="pause" disabled title="停止领取任务并取消队列">暂停</button></div>
     <p id="status">请登录并打开一个专用空白对话，然后启动。</p>
