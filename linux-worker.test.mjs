@@ -59,7 +59,8 @@ async function fixture(t, { draft = '', generate = true } = {}) {
 }
 
 async function until(check) {
-  for (let i = 0; i < 100; i++) {
+  // 分片输入把单题耗时拉到数秒，轮询上限相应放宽到 20 秒
+  for (let i = 0; i < 1000; i++) {
     if (await check()) return;
     await new Promise(resolve => setTimeout(resolve, 20));
   }
@@ -72,7 +73,7 @@ test('headless configuration accepts only the local bridge and never the paid AP
   assert.throws(() => bridgeConfig({ API_TOKEN: 'x', BACKEND: 'deepseek-api' }), /web-bridge/);
 });
 
-test('real headless Chromium sends two questions serially and returns OCS answers', { timeout: 10000 }, async t => {
+test('real headless Chromium sends two questions serially and returns OCS answers', { timeout: 45000 }, async t => {
   const f = await fixture(t);
   const done = f.start();
   await until(async () => (await f.health()).connected);
@@ -103,7 +104,7 @@ test('drafts and another registered browser stop the worker without sending or s
   assert.equal(await occupied.page.evaluate(() => window.sent), 0);
 });
 
-test('OCS cancellation keeps the worker alive and never repeats a send', { timeout: 10000 }, async t => {
+test('OCS cancellation keeps the worker alive and never repeats a send', { timeout: 30000 }, async t => {
   const f = await fixture(t, { generate: false });
   const done = f.start();
   await until(async () => (await f.health()).connected);

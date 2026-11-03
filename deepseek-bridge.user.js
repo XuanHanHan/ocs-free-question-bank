@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OCS DeepSeek 网页桥接
 // @namespace    local.ocs.deepseek.bridge
-// @version      1.6.0
+// @version      1.7.0
 // @description  在已登录的 DeepSeek 网页处理本机 OCS 题目，无需 DeepSeek API 密钥
 // @match        https://chat.deepseek.com/*
 // @grant        GM_xmlhttpRequest
@@ -50,8 +50,23 @@
     }
     return null;
   }
+  // 人工节奏参数：DeepSeek 对短时间内连续提问会触发风控，这里把整套动作放慢；需要更慢/更快直接改这些数
+  const PACE = {
+    beforeType: [600, 1400],    // 敲字前的停顿（毫秒）
+    beforeSend: [400, 1000],    // 发送前的停顿
+    chunk: [4, 9],              // 每片敲入的字数
+    chunkGap: [60, 120],        // 两片之间的间隔，约等于每秒 8-14 字
+    cooldown: [15000, 35000],   // 两题之间的冷却
+    longCooldown: [30000, 45000], // 每 longEvery 题来一次长冷却，模拟看题/翻页
+    longEvery: 8
+  };
+  const jitter = ([min, max], random = Math.random) => min + random() * (max - min);
+  function nextCooldown(answered, random = Math.random, pace = PACE) {
+    if (!answered) return 0;
+    return jitter(answered % pace.longEvery === 0 ? pace.longCooldown : pace.cooldown, random);
+  }
   async function runJob(job, ui, { now = Date.now, sleep = ms => new Promise(r => setTimeout(r, ms)), running = () => true,
-    typing = true, random = Math.random } = {}) {
+    typing = true, random = Math.random, pace = PACE } = {}) {
     const check = () => {
       if (!running()) throw new Error('桥接已暂停');
       if (now() >= job.deadline) throw new Error('本题超时，请检查网页后重新启动');
@@ -68,18 +83,18 @@
     }
     if (typing) {
       // 一次 setValue 写满会和真人操作差别太大：停顿一下，再按随机长度分片敲进去
-      await sleep(200 + random() * 500);
-      const step = Math.max(8, Math.ceil(job.prompt.length / 60));
+      await sleep(jitter(pace.beforeType, random));
+      const step = Math.max(pace.chunk[0], Math.ceil(job.prompt.length / 80));
       let typed = '';
       while (typed.length < job.prompt.length) {
-        const size = Math.max(4, Math.round(step * (0.7 + random() * 0.6)));
+        const size = Math.max(2, Math.round(step * (0.6 + random() * 0.8)));
         typed = job.prompt.slice(0, typed.length + size);
         ui.fill(typed);
         check();
-        await sleep(15 + random() * 45);
+        await sleep(jitter(pace.chunkGap, random));
       }
       if (ui.draft() !== job.prompt) ui.fill(job.prompt);
-      await sleep(150 + random() * 350);
+      await sleep(jitter(pace.beforeSend, random));
     } else {
       ui.fill(job.prompt);
     }
@@ -155,9 +170,9 @@
   }
 
   const clientId = crypto.randomUUID();
-  const VERSION = '1.6.0';
+  const VERSION = '1.7.0';
   const ui = createDomAdapter(document);
-  let active = false, loop = null, heartbeat = null, heartbeatBusy = false, registered = false, stopping = null, epoch = 0;
+  let active = false, loop = null, heartbeat = null, heartbeatBusy = false, registered = false, stopping = null, epoch = 0, answered = 0;
   let address = GM_getValue('address', 'http://127.0.0.1:3000');
   let token = GM_getValue('token', '');
   const host = document.createElement('div');
@@ -203,7 +218,7 @@
     section.collapsed #body,section.collapsed #cfg{display:none}
     section.collapsed .ver{display:none}
     section.collapsed header{border-bottom:0;padding:3px 4px 3px 10px}
-    </style><section id="panel"><header id="bar" title="拖动可移动"><strong>OCS 桥接</strong><span class="ver">v1.6</span><span id="dot" data-tone="idle"></span><button id="cfg" title="服务地址与口令">⚙</button><button id="fold" title="收起">−</button></header>
+    </style><section id="panel"><header id="bar" title="拖动可移动"><strong>OCS 桥接</strong><span class="ver">v1.7</span><span id="dot" data-tone="idle"></span><button id="cfg" title="服务地址与口令">⚙</button><button id="fold" title="收起">−</button></header>
     <div id="body">
     <div class="row"><button id="start" title="开始领取 OCS 题目">启动</button><button id="pause" disabled title="停止领取任务并取消队列">暂停</button></div>
     <p id="status">请登录并打开一个专用空白对话，然后启动。</p>
@@ -316,6 +331,17 @@
       try { await stopping; } finally { stopping = null; }
     }
   }
+  // 题间冷却：面板上每秒刷新剩余时间，暂停/断开时立即中断
+  const cooldown = ms => new Promise(resolve => {
+    if (!(ms > 0)) { resolve(); return; }
+    const startedAt = Date.now();
+    display(`冷却 ${Math.ceil(ms / 1000)}s（已完成 ${answered} 题）`, 'ok');
+    const timer = setInterval(() => {
+      const left = ms - (Date.now() - startedAt);
+      if (!active || left <= 0) { clearInterval(timer); resolve(); return; }
+      display(`冷却 ${Math.ceil(left / 1000)}s（已完成 ${answered} 题）`, 'ok');
+    }, 500);
+  });
   async function processQueue() {
     try {
       while (active) {
@@ -344,6 +370,9 @@
           } finally { clearInterval(probe); }
           if (!active) break;
           await request('/bridge/result', { id: job.id, answer });
+          answered += 1;
+          await cooldown(nextCooldown(answered));
+          if (!active) break;
           display('本题已返回，等待下一题。', 'ok');
         }
         await new Promise(resolve => setTimeout(resolve, 200));
