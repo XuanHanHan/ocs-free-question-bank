@@ -19,7 +19,9 @@ function buildPrompt(input) {
   const options = input.options.length
     ? `\n\n选项：\n${input.options.map((option, index) => `${String.fromCharCode(65 + index)}. ${option}`).join('\n')}`
     : '';
-  return `帮我看看这道题，先简单说下理由，最后一行写「答案：X」就行。${hint}\n\n题目：${input.question}${options}`;
+  return '帮我看看这道题，先简单说下理由，最后一行写「答案：X」就行，答案后面别加括号说明。' + hint +
+    '如果这道题没有唯一答案（主观题、要结合个人情况写），直接写「无法作答」并说明原因，不要编一个答案。' +
+    `\n\n题目：${input.question}${options}`;
 }
 
 class BridgeQueue {

@@ -20,6 +20,17 @@ test('parses natural 「答案：X」 replies and still tolerates JSON', { skip:
   assert.deepEqual(bridge.parseAnswer(json), { answers: ['2'], explanation: '解析' });
   assert.deepEqual(bridge.parseAnswer('说明\n```json\n' + json + '\n```'), { answers: ['2'], explanation: '解析' });
 });
+test('subjective prose answers and bracket notes are handled', { skip: !bridge.parseAnswer }, () => {
+  // 主观题：模型给了一整段说明，不能拆成几十个答案塞给 OCS
+  const prose = '理由：该题属于实践操作类作业，没有唯一标准答案。\n答案：按图表顺序，需填写的评估内容依次为：创新、合作、敬业、学习、责任、执着、诚信、能力、素质（需根据自身情况勾选）';
+  assert.deepEqual(bridge.parseAnswer(prose, 'completion').answers, []);
+  // 明确回复无法作答：直接按“无答案”回给 OCS
+  assert.deepEqual(bridge.parseAnswer('无法作答：这是主观题，需要结合个人情况。', 'completion').answers, []);
+  // 答案后面带括号说明，只留字母
+  assert.deepEqual(bridge.parseAnswer('答案：A（选 A 因为最快）', 'single'), { answers: ['A'], explanation: '来自 DeepSeek 网页回答' });
+  // 答案后面跟了第二句，不该混进答案
+  assert.deepEqual(bridge.parseAnswer('答案：A、C。解析略', 'multiple').answers, ['A', 'C']);
+});
 test('explanation comes from the text before the answer line', { skip: !bridge.parseAnswer }, () => {
   assert.deepEqual(bridge.parseAnswer('2 和 3 是质数。\n答案：2、3'),
     { answers: ['2', '3'], explanation: '2 和 3 是质数。' });

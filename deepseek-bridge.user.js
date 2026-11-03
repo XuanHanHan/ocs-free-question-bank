@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OCS DeepSeek 网页桥接
 // @namespace    local.ocs.deepseek.bridge
-// @version      1.9.0
+// @version      1.11.0
 // @description  在已登录的 DeepSeek 网页处理本机 OCS 题目，无需 DeepSeek API 密钥
 // @match        https://chat.deepseek.com/*
 // @grant        GM_xmlhttpRequest
@@ -54,8 +54,21 @@
     const compact = String(text).replace(/\s+/g, '');
     return /^[A-Ha-h](?:[、,，/]*[A-Ha-h])*$/.test(compact) || /^(对|错|正确|错误|是|否|√|×)$/.test(compact);
   }
+  /** 去掉「A（选 A 因为快）」这类后缀说明；只在剩余部分是选项字母/判断词时才去掉，避免误伤公式 */
+  function stripNote(text) {
+    const matched = String(text).match(/^(.{1,12}?)\s*[（(][^）)]*[）)]$/);
+    if (!matched) return text;
+    const head = matched[1].replace(/\s+/g, '');
+    return /^[A-Ha-h]{1,8}$/.test(head) || /^(对|错|正确|错误)$/.test(head) ? matched[1].trim() : text;
+  }
+  /** 按题型限制条数与长度；模型给的是成段文字（主观题常见）时判为没有可靠答案 */
+  function sanitizeAnswers(answers, type) {
+    const [maxCount, maxLength] = { single: [1, 24], judgement: [1, 12], multiple: [8, 24], completion: [6, 80] }[type] || [8, 40];
+    const list = answers.map(stripNote).filter(item => item && item.length <= maxLength && !/[。！？!?]/.test(item));
+    return list.length > maxCount ? [] : list;
+  }
   /** 解析网页回答：优先按自然语言的「答案：X」取，模型仍回 JSON 时也能兼容 */
-  function parseAnswer(text) {
+  function parseAnswer(text, type = 'unknown') {
     const raw = String(text || '').trim();
     if (!raw) return null;
     for (const candidate of [raw, ...jsonObjects(raw)]) {
@@ -68,6 +81,10 @@
     }
     const lines = raw.split('\n').map(line => line.replace(/[*_`]/g, '').trim()).filter(Boolean);
     const marker = lines.findIndex(line => /答\s*案\s*(?:是|[:：]|$)/.test(line));
+    // 完全没有「答案」、又是在说做不了/没有标准答案：直接按“无答案”回给 OCS，别让它干等
+    if (marker < 0 && /无法作答|无法确定|无法判断|没有(唯一|标准)答案|需要你(自己|独立)|主观题/.test(raw)) {
+      return { answers: [], explanation: raw.slice(0, 12000) };
+    }
     const single = marker < 0 && lines.length === 1 && lines[0].length <= 60 && looksLikeAnswer(lines[0]) ? lines[0] : '';
     let answerText = single, before = '';
     if (marker >= 0) {
@@ -75,9 +92,14 @@
       const matched = lines[marker].match(/答\s*案\s*(?:是|[:：])?\s*/);
       answerText = lines[marker].slice(matched.index + matched[0].length);
       before = [...lines.slice(0, marker), lines[marker].slice(0, matched.index).trim()].filter(Boolean).join(' ').trim();
+      // 只取第一句，后面的「解析…」不要混进答案
+      answerText = answerText.split(/[。！？]/)[0];
     }
-    const answers = splitAnswers(answerText);
-    if (!answers.length) return null;
+    const answers = sanitizeAnswers(splitAnswers(answerText), type);
+    if (!answers.length) {
+      // 有「答案：」但内容是成段说明 → 明确回“没答案”，比塞一堆错答案好
+      return marker >= 0 ? { answers: [], explanation: before.slice(0, 12000) || raw.slice(0, 12000) } : null;
+    }
     const explanation = before.slice(0, 12000) || '来自 DeepSeek 网页回答';
     return { answers, explanation };
   }
@@ -87,9 +109,9 @@
     beforeSend: [400, 1000],    // 发送前的停顿
     chunk: [4, 9],              // 每片敲入的字数
     chunkGap: [60, 120],        // 两片之间的间隔，约等于每秒 8-14 字
-    cooldown: [15000, 35000],   // 两题之间的冷却
-    longCooldown: [30000, 45000], // 每 longEvery 题来一次长冷却，模拟看题/翻页
-    longEvery: 8
+    cooldown: [6000, 12000],    // 两题之间的冷却
+    longCooldown: [20000, 28000], // 每 longEvery 题来一次长冷却，模拟看题/翻页
+    longEvery: 10
   };
   const jitter = ([min, max], random = Math.random) => min + random() * (max - min);
   function nextCooldown(answered, random = Math.random, pace = PACE) {
@@ -177,7 +199,7 @@
       const latest = ui.count() > baseline ? ui.replies().slice(-1)[0] : '';
       // 只看回复正文是否稳定：网页的“生成中”状态可能比答案晚结束很多（实测 93 秒 vs 3 秒），
       // 不能拿它当回传条件，否则 OCS 会一直转圈。
-      const parsed = latest ? parseAnswer(latest) : null;
+      const parsed = latest ? parseAnswer(latest, job.input?.type) : null;
       if (parsed) {
         if (latest !== stableText) { stableText = latest; stableSince = now(); }
         else if (now() - stableSince >= 600) return { bridge_id: job.id, ...parsed };
@@ -230,7 +252,7 @@
   }
 
   const clientId = crypto.randomUUID();
-  const VERSION = '1.9.0';
+  const VERSION = '1.11.0';
   const ui = createDomAdapter(document);
   let active = false, loop = null, heartbeat = null, heartbeatBusy = false, registered = false, stopping = null, epoch = 0, answered = 0;
   let address = GM_getValue('address', 'http://127.0.0.1:3000');
@@ -278,7 +300,7 @@
     section.collapsed #body,section.collapsed #cfg{display:none}
     section.collapsed .ver{display:none}
     section.collapsed header{border-bottom:0;padding:3px 4px 3px 10px}
-    </style><section id="panel"><header id="bar" title="拖动可移动"><strong>OCS 桥接</strong><span class="ver">v1.9</span><span id="dot" data-tone="idle"></span><button id="cfg" title="服务地址与口令">⚙</button><button id="fold" title="收起">−</button></header>
+    </style><section id="panel"><header id="bar" title="拖动可移动"><strong>OCS 桥接</strong><span class="ver">v1.11</span><span id="dot" data-tone="idle"></span><button id="cfg" title="服务地址与口令">⚙</button><button id="fold" title="收起">−</button></header>
     <div id="body">
     <div class="row"><button id="start" title="开始领取 OCS 题目">启动</button><button id="pause" disabled title="停止领取任务并取消队列">暂停</button></div>
     <p id="status">请登录并打开一个专用空白对话，然后启动。</p>
@@ -416,7 +438,7 @@
             try {
               const replies = ui.replies();
               const seconds = Math.round((Date.now() - startedAt) / 1000);
-              const parsed = replies.filter(text => parseAnswer(text)).length;
+              const parsed = replies.filter(text => parseAnswer(text, job.input?.type)).length;
               const longest = replies.reduce((max, text) => Math.max(max, text.length), 0);
               const idle = ui.isIdle() ? '是' : '否';
               console.log(`[OCS bridge] ${seconds}s 回复块=${replies.length} 可解析=${parsed} 空闲=${idle} 最长文本=${longest}`);
