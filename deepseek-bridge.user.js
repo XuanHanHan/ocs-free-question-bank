@@ -1,7 +1,10 @@
 // ==UserScript==
 // @name         OCS DeepSeek 网页桥接
 // @namespace    local.ocs.deepseek.bridge
-// @version      1.12.0
+// @author       XuanHanHan（原作者）、42419（fork 维护）
+// @homepageURL  https://github.com/XuanHanHan/ocs-free-question-bank
+// @source       https://github.com/XuanHanHan/ocs-free-question-bank
+// @version      1.12.1
 // @description  在已登录的 DeepSeek 网页处理本机 OCS 题目，无需 DeepSeek API 密钥
 // @match        https://chat.deepseek.com/*
 // @grant        GM_xmlhttpRequest
@@ -9,6 +12,9 @@
 // @grant        GM_setValue
 // @connect      127.0.0.1
 // @connect      localhost
+// @updateURL    https://raw.githubusercontent.com/42419/ocs-free-question-bank/main/deepseek-bridge.user.js
+// @downloadURL  https://raw.githubusercontent.com/42419/ocs-free-question-bank/main/deepseek-bridge.user.js
+// @supportURL   https://github.com/42419/ocs-free-question-bank
 // @run-at       document-idle
 // @noframes
 // ==/UserScript==
@@ -264,7 +270,7 @@
   }
 
   const clientId = crypto.randomUUID();
-  const VERSION = '1.12.0';
+  const VERSION = '1.12.1';
   const ui = createDomAdapter(document);
   let active = false, loop = null, heartbeat = null, heartbeatBusy = false, registered = false, stopping = null, epoch = 0, answered = 0;
   let address = GM_getValue('address', 'http://127.0.0.1:3000');
@@ -312,7 +318,7 @@
     section.collapsed #body,section.collapsed #cfg{display:none}
     section.collapsed .ver{display:none}
     section.collapsed header{border-bottom:0;padding:3px 4px 3px 10px}
-    </style><section id="panel"><header id="bar" title="拖动可移动"><strong>OCS 桥接</strong><span class="ver">v1.12</span><span id="dot" data-tone="idle"></span><button id="cfg" title="服务地址与口令">⚙</button><button id="fold" title="收起">−</button></header>
+    </style><section id="panel"><header id="bar" title="拖动可移动"><strong>OCS 桥接</strong><span class="ver">v1.12.1</span><span id="dot" data-tone="idle"></span><button id="cfg" title="服务地址与口令">⚙</button><button id="fold" title="收起">−</button></header>
     <div id="body">
     <div class="row"><button id="start" title="开始领取 OCS 题目">启动</button><button id="pause" disabled title="停止领取任务并取消队列">暂停</button></div>
     <p id="status">请登录并打开一个专用空白对话，然后启动。</p>
