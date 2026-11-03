@@ -23,16 +23,14 @@ async function fixture(t, { draft = '', generate = true } = {}) {
       input.addEventListener('input', () => button.setAttribute('aria-disabled', input.value ? 'false' : 'true'));
       button.addEventListener('click', () => {
         window.sent++;
-        const id = input.value.match(/"bridge_id":"([^"]+)"/)[1];
         input.value = '';
         button.setAttribute('aria-disabled', 'true');
         button.innerHTML = '<span class="ds-loading">生成中</span>';
         if (${generate}) setTimeout(() => {
           const reply = document.createElement('div');
           reply.className = 'ds-assistant-message-main-content';
-          const pre = document.createElement('pre'), code = document.createElement('code');
-          code.textContent = JSON.stringify({ bridge_id: id, answers: ['2', '3'], explanation: '2和3是质数。' });
-          pre.append(code); reply.append(pre); document.body.append(reply);
+          reply.textContent = '2和3是质数。\\n答案：2、3';
+          document.body.append(reply);
           button.innerHTML = '发送';
         }, 250);
       });

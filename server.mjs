@@ -7,8 +7,19 @@ class BridgeError extends Error {
 }
 const failure = (status, message) => new BridgeError(status, message);
 
-function buildPrompt(id, input) {
-  return `直接解答下面这道题，不要联网搜索或展开推理。只输出 JSON：{"bridge_id":"${id}","answers":["答案"],"explanation":"简短理由"}。选择题填写完整选项文字（单选一个，多选可多个）；判断写正确或错误；填空按顺序逐空填写。无法确定时 answers 返回空数组。题目：${JSON.stringify(input)}`;
+function buildPrompt(input) {
+  // 用自然语言提问：正常对话里没人会贴 JSON 和任务编号，那种格式本身就是一个明显的机器特征
+  const hint = {
+    single: '单选题，只选一个。',
+    multiple: '多选题，有几个选几个，用顿号隔开。',
+    judgement: '判断题，写「对」或「错」。',
+    completion: '填空题，按顺序写要填的内容。',
+    fill: '填空题，按顺序写要填的内容。'
+  }[input.type] || '';
+  const options = input.options.length
+    ? `\n\n选项：\n${input.options.map((option, index) => `${String.fromCharCode(65 + index)}. ${option}`).join('\n')}`
+    : '';
+  return `帮我看看这道题，先简单说下理由，最后一行写「答案：X」就行。${hint}\n\n题目：${input.question}${options}`;
 }
 
 class BridgeQueue {
@@ -73,13 +84,13 @@ class BridgeQueue {
     this.note(error.status, error.message);
     for (const job of [...this.jobs]) this.settle(job, error);
   }
-  enqueue(input, signal) {
+  enqueue(input, signal, images = []) {
     this.check();
     if (!this.worker) throw failure(503, '请先在已登录的 DeepSeek 网页启动桥接脚本');
     if (this.jobs.length >= this.maxQueue) throw failure(429, '队列已满，请将 OCS 查询线程数设为 1');
     if (signal?.aborted) throw failure(499, '查询已取消');
     return new Promise((resolve, reject) => {
-      const job = { id: randomUUID(), input, resolve, reject, claimed: false, abandoned: false, done: false,
+      const job = { id: randomUUID(), input, images, resolve, reject, claimed: false, abandoned: false, done: false,
         enqueuedAt: Date.now(), deadline: Date.now() + this.jobTimeoutMs, signal };
       job.abort = () => {
         // 调用方（OCS）断开时不暂停桥接：题目可能已经发到网页，等它答完后丢掉结果即可，
@@ -102,7 +113,7 @@ class BridgeQueue {
     const job = this.jobs[0];
     if (!job || job.claimed) return null;
     job.claimed = true;
-    return { id: job.id, input: job.input, prompt: buildPrompt(job.id, job.input), deadline: job.deadline, enqueuedAt: job.enqueuedAt };
+    return { id: job.id, input: job.input, prompt: buildPrompt(job.input), images: job.images, deadline: job.deadline, enqueuedAt: job.enqueuedAt };
   }
   complete(clientId, id, answer) {
     this.touch(clientId);
@@ -147,6 +158,50 @@ async function readJson(req) {
     return body;
   } catch { throw failure(400, '请求不是有效 JSON 对象'); }
 }
+// OCS 的图片题常常把 <img src> 或图片地址塞在题干里。这里把图片下载到本地，页面再当成
+// “用户选的文件”上传，比把链接当文字发过去更接近真人操作，DeepSeek 也才真的能看见图。
+const BLOBS = new Map();
+const IMAGE_LIMIT = 3, IMAGE_BYTES = 8 * 1024 * 1024;
+const IMAGE_PATTERN = /<img[^>]+src=["']([^"']+)["']|https?:\/\/[^\s"'<>]+?\.(?:png|jpe?g|gif|webp|bmp)(?:\?[^\s"'<>]*)?/gi;
+function findImageUrls(text) {
+  const urls = [];
+  for (const match of String(text).matchAll(IMAGE_PATTERN)) {
+    const url = match[1] || match[0];
+    if (url && !urls.includes(url) && urls.length < IMAGE_LIMIT) urls.push(url);
+  }
+  return urls;
+}
+function stripImageUrls(text) {
+  if (!text) return text;
+  return String(text).replace(/<img[^>]*>/gi, ' ').replace(IMAGE_PATTERN, ' ').replace(/\s{2,}/g, ' ').trim();
+}
+async function downloadImage(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10000);
+  try {
+    const response = await fetch(url, { signal: controller.signal, redirect: 'follow' });
+    if (!response.ok) return null;
+    const type = (response.headers.get('content-type') || '').split(';')[0].trim();
+    if (!/^image\//.test(type)) return null;
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (!buffer.length || buffer.length > IMAGE_BYTES) return null;
+    return { type, buffer };
+  } catch { return null; } finally { clearTimeout(timer); }
+}
+async function prepareImages(text) {
+  const images = [];
+  for (const url of findImageUrls(text)) {
+    const file = await downloadImage(url);
+    if (!file) continue;
+    const id = randomUUID();
+    BLOBS.set(id, file);
+    while (BLOBS.size > 20) BLOBS.delete(BLOBS.keys().next().value);
+    const ext = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp', 'image/bmp': 'bmp' }[file.type] || 'png';
+    images.push({ id, type: file.type, name: `题目图片-${images.length + 1}.${ext}` });
+  }
+  return images;
+}
+
 function normalize(input) {
   if (typeof input.question !== 'string' || !input.question.trim() || input.question.length > 12000) throw failure(400, 'question 必须为 1–12000 字符的非空字符串');
   let options = input.options ?? [];
@@ -197,6 +252,17 @@ export function createServer({ token, monitorIntervalMs = 250, apiSolver = null,
       if (req.method === 'HEAD' && (requestPath === '/' || requestPath === '/search')) {
         return reply(200, {});
       }
+      // 桥接脚本把图片取回本地，做成 File 塞进网页的上传控件；id 是随机 UUID，只监听本机
+      if (req.method === 'GET' && requestPath.startsWith('/blob/')) {
+        const file = BLOBS.get(requestPath.slice(6));
+        if (!file) throw failure(404, '图片不存在或已过期');
+        status = 200;
+        if (!res.destroyed && !res.writableEnded) {
+          res.writeHead(200, { 'Content-Type': file.type, 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' });
+          res.end(file.buffer);
+        }
+        return;
+      }
       if (requestPath === '/health' && req.method === 'GET') {
         return reply(200, apiSolver
           ? { status: 'ok', mode: 'deepseek-api', connected: true, queued: 0 }
@@ -211,6 +277,11 @@ export function createServer({ token, monitorIntervalMs = 250, apiSolver = null,
       if (req.headers.authorization !== `Bearer ${token}` && body.token !== token) throw failure(401, 'API_TOKEN 不正确');
       if (requestPath === '/search') {
         const input = normalize(body);
+        const images = await prepareImages([input.question, ...input.options].join(String.fromCharCode(10)));
+        if (images.length) {
+          input.question = stripImageUrls(input.question) || "（题目见图片）";
+          input.options = input.options.map(stripImageUrls);
+        }
         const abort = new AbortController();
         const onClose = () => { if (!res.writableEnded) abort.abort(); };
         res.on('close', onClose);
@@ -227,7 +298,7 @@ export function createServer({ token, monitorIntervalMs = 250, apiSolver = null,
               data: answer.answers.length ? [{ question: input.question, answer: answer.answers.map(value => value.trim()).join('#'), explanation: answer.explanation }] : [],
               explanation: answer.explanation });
           } else {
-            reply(200, await queue.enqueue(input, abort.signal));
+            reply(200, await queue.enqueue(input, abort.signal, images));
           }
         }
         finally { res.off('close', onClose); }

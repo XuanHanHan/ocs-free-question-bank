@@ -88,10 +88,10 @@ export async function runBridgeWorker({ page, address, token, signal = new Abort
       const { job } = await request('/bridge/poll');
       if (job) {
         log('正在解题。');
-        const answer = await abortable(page.evaluate(job => {
+        const answer = await abortable(page.evaluate(({ job, blobBase }) => {
           const { runJob, createDomAdapter } = window.__ocsLinuxBridge;
-          return runJob(job, createDomAdapter(document), { running: () => window.__ocsLinuxRunning });
-        }, job), runningSignal);
+          return runJob(job, createDomAdapter(document), { running: () => window.__ocsLinuxRunning, blobBase });
+        }, { job, blobBase: address }), runningSignal);
         await request('/bridge/result', { id: job.id, answer });
         log('答案已返回 OCS，等待下一题。');
       }

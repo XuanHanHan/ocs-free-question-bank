@@ -58,7 +58,7 @@ test('browser returns answer through actual HTTP and OCS handler', async t => {
   const waiting = post('/search', question);
   const job = await claim(call);
   assert.deepEqual(job.input.options, ['2', '3', '4']);
-  assert.ok(job.prompt.includes(job.id));
+  assert.ok(job.prompt.includes(job.input.question));
   assert.equal((await call('/bridge/poll')).job, null);
   await call('/bridge/result', { id: job.id, answer: answer(job.id) });
   const result = await (await waiting).json();
@@ -218,4 +218,26 @@ test('each OCS request is logged with status and duration; health keeps the last
   assert.equal((await waiting).status, 200);
   assert.match(lines.join('\n'), /POST \/bridge\/poll → 200 \d+ms · 领取题目（排队 \d+ms）/);
   assert.match(lines.join('\n'), /POST \/bridge\/connect → 200 \d+ms · 桥接脚本 v9\.9\.9/);
+});
+test('downloads images embedded in the question and serves them back as blobs', async t => {
+  const { createServer: createHttpServer } = await import('node:http');
+  const png = Buffer.from('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a49444154789c6300010000050001', 'hex');
+  const imageServer = createHttpServer((req, res) => { res.writeHead(200, { 'Content-Type': 'image/png' }); res.end(png); });
+  await new Promise(resolve => imageServer.listen(0, '127.0.0.1', resolve));
+  t.after(() => imageServer.close());
+  const url = `http://127.0.0.1:${imageServer.address().port}/pic.png`;
+
+  const { base, post, call } = await fixture(t);
+  await call('/bridge/connect');
+  const waiting = post('/search', { question: `看图作答 <img src="${url}">`, options: ['A. 对'], type: 'multiple' });
+  const job = await claim(call);
+  assert.equal(job.images.length, 1);
+  assert.equal(job.images[0].type, 'image/png');
+  assert.equal(job.input.question.includes('pic.png'), false, '题干里的图片地址应被移除');
+  const blob = await fetch(`${base}/blob/${job.images[0].id}`);
+  assert.equal(blob.status, 200);
+  assert.equal(blob.headers.get('content-type'), 'image/png');
+  assert.equal((await blob.arrayBuffer()).byteLength, png.length);
+  await call('/bridge/result', { id: job.id, answer: answer(job.id) });
+  assert.equal((await waiting).status, 200);
 });

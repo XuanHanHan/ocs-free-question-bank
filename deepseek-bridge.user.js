@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OCS DeepSeek 网页桥接
 // @namespace    local.ocs.deepseek.bridge
-// @version      1.7.0
+// @version      1.9.0
 // @description  在已登录的 DeepSeek 网页处理本机 OCS 题目，无需 DeepSeek API 密钥
 // @match        https://chat.deepseek.com/*
 // @grant        GM_xmlhttpRequest
@@ -40,15 +40,46 @@
     }
     return found;
   }
-  function parseReply(text, id) {
-    const candidates = [text.trim(), ...jsonObjects(text)];
-    for (const candidate of candidates) {
+  /** 把「答案：A、C」这类自然回答拆成选项数组；顿号、逗号、斜杠、和/及都能分 */
+  function splitAnswers(text) {
+    const cleaned = String(text).replace(/^[\s是为：:、,，*_`]+/, '').replace(/[。．.；;\s*_`]+$/, '').trim();
+    if (!cleaned) return [];
+    const parts = cleaned.split(/\s*[、,，/；;]\s*|\s+和\s+|\s+及\s+/).map(part => part.trim()).filter(Boolean);
+    const list = parts.length > 1 ? parts
+      : (/^(?:[A-Ha-h]\s+)+[A-Ha-h]$/.test(cleaned) ? cleaned.split(/\s+/) : [cleaned]);
+    return list.filter(part => part.length <= 60).slice(0, 100);
+  }
+  /** 只有形似答案的短句（选项字母、判断词）才允许在没有「答案：」前缀时被采纳 */
+  function looksLikeAnswer(text) {
+    const compact = String(text).replace(/\s+/g, '');
+    return /^[A-Ha-h](?:[、,，/]*[A-Ha-h])*$/.test(compact) || /^(对|错|正确|错误|是|否|√|×)$/.test(compact);
+  }
+  /** 解析网页回答：优先按自然语言的「答案：X」取，模型仍回 JSON 时也能兼容 */
+  function parseAnswer(text) {
+    const raw = String(text || '').trim();
+    if (!raw) return null;
+    for (const candidate of [raw, ...jsonObjects(raw)]) {
       let value;
-      try { value = JSON.parse(candidate); } catch { continue; }
-      if (value && value.bridge_id === id && Array.isArray(value.answers) &&
-          value.answers.every(s => typeof s === 'string' && s.trim()) && typeof value.explanation === 'string') return value;
+      try { value = JSON.parse(candidate.trim()); } catch { continue; }
+      if (value && Array.isArray(value.answers) && value.answers.every(s => typeof s === 'string' && s.trim()) &&
+          typeof value.explanation === 'string') {
+        return { answers: value.answers, explanation: value.explanation };
+      }
     }
-    return null;
+    const lines = raw.split('\n').map(line => line.replace(/[*_`]/g, '').trim()).filter(Boolean);
+    const marker = lines.findIndex(line => /答\s*案\s*(?:是|[:：]|$)/.test(line));
+    const single = marker < 0 && lines.length === 1 && lines[0].length <= 60 && looksLikeAnswer(lines[0]) ? lines[0] : '';
+    let answerText = single, before = '';
+    if (marker >= 0) {
+      // 「答案」可能出现在整段回答的中间（一行里先写理由再写答案），把同一行前半段也算进解析
+      const matched = lines[marker].match(/答\s*案\s*(?:是|[:：])?\s*/);
+      answerText = lines[marker].slice(matched.index + matched[0].length);
+      before = [...lines.slice(0, marker), lines[marker].slice(0, matched.index).trim()].filter(Boolean).join(' ').trim();
+    }
+    const answers = splitAnswers(answerText);
+    if (!answers.length) return null;
+    const explanation = before.slice(0, 12000) || '来自 DeepSeek 网页回答';
+    return { answers, explanation };
   }
   // 人工节奏参数：DeepSeek 对短时间内连续提问会触发风控，这里把整套动作放慢；需要更慢/更快直接改这些数
   const PACE = {
@@ -66,11 +97,29 @@
     return jitter(answered % pace.longEvery === 0 ? pace.longCooldown : pace.cooldown, random);
   }
   async function runJob(job, ui, { now = Date.now, sleep = ms => new Promise(r => setTimeout(r, ms)), running = () => true,
-    typing = true, random = Math.random, pace = PACE } = {}) {
+    typing = true, random = Math.random, pace = PACE, blobBase = '' } = {}) {
     const check = () => {
       if (!running()) throw new Error('桥接已暂停');
       if (now() >= job.deadline) throw new Error('本题超时，请检查网页后重新启动');
       ui.check();
+    };
+    // 把服务端下载好的图片做成 File 塞进网页的上传控件，等同于用户点回形针选图；找不到控件就退化成纯文字
+    const attachImages = async images => {
+      const input = ui.fileInput();
+      if (!input || !blobBase) return 0;
+      const transfer = new DataTransfer();
+      // 单文件控件塞多张会被浏览器截断甚至报错，按控件能力截断
+      for (const image of images.slice(0, input.multiple ? images.length : 1)) {
+        try {
+          const response = await fetch(`${blobBase}/blob/${image.id}`, { signal: AbortSignal.timeout(8000) });
+          if (!response.ok) continue;
+          transfer.items.add(new File([await response.blob()], image.name, { type: image.type }));
+        } catch { /* 单张失败不影响整题 */ }
+      }
+      if (!transfer.files.length) return 0;
+      input.files = transfer.files;
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      return transfer.files.length;
     };
     check();
     if (ui.draft().trim()) throw new Error('输入框有草稿，请清空后重新启动桥接');
@@ -81,6 +130,10 @@
       if (now() >= idleDeadline) throw new Error('网页仍在生成，等待 60 秒后放弃，请检查网页再重新启动');
       await sleep(150);
     }
+    // 记下当前已有的回复条数，之后只认新增的那条
+    const baseline = ui.count();
+    // 图片先挂上去，上传和打字并行
+    if (job.images?.length) await attachImages(job.images);
     if (typing) {
       // 一次 setValue 写满会和真人操作差别太大：停顿一下，再按随机长度分片敲进去
       await sleep(jitter(pace.beforeType, random));
@@ -98,7 +151,10 @@
     } else {
       ui.fill(job.prompt);
     }
-    const sendDeadline = Math.min(job.deadline, now() + 3000);
+    // 图片上传是异步的，给缩略图/上传收尾留点时间再点发送
+    if (job.images?.length) await sleep(1200 + random() * 800);
+    // 带图时上传期间发送按钮会一直灰着，给更长的等待
+    const sendDeadline = Math.min(job.deadline, now() + (job.images?.length ? 20000 : 3000));
     while (!ui.canSend()) {
       check();
       if (now() >= sendDeadline) throw new Error('未能启用发送按钮，请检查网页');
@@ -117,12 +173,14 @@
     while (true) {
       check();
       if (ui.url() !== conversationUrl) throw new Error('对话页面已切换，桥接暂停以避免串题');
+      // 只认发送之后新增的那条回复，避免把上一题的答案当成这一题的
+      const latest = ui.count() > baseline ? ui.replies().slice(-1)[0] : '';
       // 只看回复正文是否稳定：网页的“生成中”状态可能比答案晚结束很多（实测 93 秒 vs 3 秒），
       // 不能拿它当回传条件，否则 OCS 会一直转圈。
-      const match = ui.replies().map(text => ({ text, value: parseReply(text, job.id) })).find(item => item.value !== null);
-      if (match) {
-        if (match.text !== stableText) { stableText = match.text; stableSince = now(); }
-        else if (now() - stableSince >= 600) return match.value;
+      const parsed = latest ? parseAnswer(latest) : null;
+      if (parsed) {
+        if (latest !== stableText) { stableText = latest; stableSince = now(); }
+        else if (now() - stableSince >= 600) return { bridge_id: job.id, ...parsed };
       } else { stableText = ''; }
       await sleep(150);
     }
@@ -156,6 +214,8 @@
         return buttons.length === 1 && !disabled(buttons[0]);
       },
       clickSend: () => one(selectors.send).click(),
+      count: () => visible(selectors.answer).length,
+      fileInput: () => doc.querySelector('input[type=file]'),
       replies: () => visible(selectors.answer).slice(-3).flatMap(e => {
         const blocks = [...e.querySelectorAll('pre')];
         return blocks.length ? blocks.map(block => block.querySelector('code')?.textContent || block.innerText) : [e.innerText];
@@ -165,12 +225,12 @@
   }
   // Node's tests import pure protocol/runner helpers; the installed userscript runs below.
   if (typeof module === 'object' && module.exports) {
-    module.exports = { parseReply, runJob, createDomAdapter, selectors };
+    module.exports = { parseAnswer, splitAnswers, runJob, createDomAdapter, selectors };
     return;
   }
 
   const clientId = crypto.randomUUID();
-  const VERSION = '1.7.0';
+  const VERSION = '1.9.0';
   const ui = createDomAdapter(document);
   let active = false, loop = null, heartbeat = null, heartbeatBusy = false, registered = false, stopping = null, epoch = 0, answered = 0;
   let address = GM_getValue('address', 'http://127.0.0.1:3000');
@@ -218,7 +278,7 @@
     section.collapsed #body,section.collapsed #cfg{display:none}
     section.collapsed .ver{display:none}
     section.collapsed header{border-bottom:0;padding:3px 4px 3px 10px}
-    </style><section id="panel"><header id="bar" title="拖动可移动"><strong>OCS 桥接</strong><span class="ver">v1.7</span><span id="dot" data-tone="idle"></span><button id="cfg" title="服务地址与口令">⚙</button><button id="fold" title="收起">−</button></header>
+    </style><section id="panel"><header id="bar" title="拖动可移动"><strong>OCS 桥接</strong><span class="ver">v1.9</span><span id="dot" data-tone="idle"></span><button id="cfg" title="服务地址与口令">⚙</button><button id="fold" title="收起">−</button></header>
     <div id="body">
     <div class="row"><button id="start" title="开始领取 OCS 题目">启动</button><button id="pause" disabled title="停止领取任务并取消队列">暂停</button></div>
     <p id="status">请登录并打开一个专用空白对话，然后启动。</p>
@@ -356,7 +416,7 @@
             try {
               const replies = ui.replies();
               const seconds = Math.round((Date.now() - startedAt) / 1000);
-              const parsed = replies.filter(text => parseReply(text, job.id)).length;
+              const parsed = replies.filter(text => parseAnswer(text)).length;
               const longest = replies.reduce((max, text) => Math.max(max, text.length), 0);
               const idle = ui.isIdle() ? '是' : '否';
               console.log(`[OCS bridge] ${seconds}s 回复块=${replies.length} 可解析=${parsed} 空闲=${idle} 最长文本=${longest}`);
@@ -366,7 +426,7 @@
           let answer;
           try {
             display('正在解题：' + job.input.question.slice(0,80), 'busy');
-            answer = await runJob(job, ui, { running: () => active });
+            answer = await runJob(job, ui, { running: () => active, blobBase: address });
           } finally { clearInterval(probe); }
           if (!active) break;
           await request('/bridge/result', { id: job.id, answer });
