@@ -175,31 +175,52 @@ function stripImageUrls(text) {
   if (!text) return text;
   return String(text).replace(/<img[^>]*>/gi, ' ').replace(IMAGE_PATTERN, ' ').replace(/\s{2,}/g, ' ').trim();
 }
+const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+function refererFor(url) {
+  try {
+    const { hostname, origin } = new URL(url);
+    // 超星图床有防盗链，只放行自家站点的 Referer
+    return /(^|\.)chaoxing\.com$/.test(hostname) ? 'https://mooc1.chaoxing.com/' : origin + '/';
+  } catch { return ''; }
+}
+function sniffImageType(buffer) {
+  if (buffer.length > 8 && buffer.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex'))) return 'image/png';
+  if (buffer.length > 3 && buffer.subarray(0, 3).equals(Buffer.from('ffd8ff', 'hex'))) return 'image/jpeg';
+  const head = buffer.subarray(0, 6).toString('ascii');
+  if (head === 'GIF87a' || head === 'GIF89a') return 'image/gif';
+  if (buffer.length > 12 && buffer.subarray(0, 4).toString('ascii') === 'RIFF' && buffer.subarray(8, 12).toString('ascii') === 'WEBP') return 'image/webp';
+  if (buffer.subarray(0, 2).toString('ascii') === 'BM') return 'image/bmp';
+  return '';
+}
 async function downloadImage(url) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 10000);
   try {
-    const response = await fetch(url, { signal: controller.signal, redirect: 'follow' });
+    const response = await fetch(url, {
+      signal: controller.signal, redirect: 'follow',
+      headers: { 'User-Agent': BROWSER_UA, Referer: refererFor(url), Accept: 'image/avif,image/webp,image/png,image/*;q=0.8' }
+    });
     if (!response.ok) return null;
-    const type = (response.headers.get('content-type') || '').split(';')[0].trim();
-    if (!/^image\//.test(type)) return null;
     const buffer = Buffer.from(await response.arrayBuffer());
     if (!buffer.length || buffer.length > IMAGE_BYTES) return null;
+    let type = (response.headers.get('content-type') || '').split(';')[0].trim();
+    if (!/^image\//.test(type)) type = sniffImageType(buffer);
+    if (!type) return null;
     return { type, buffer };
   } catch { return null; } finally { clearTimeout(timer); }
 }
 async function prepareImages(text) {
-  const images = [];
+  const images = [], failed = [];
   for (const url of findImageUrls(text)) {
     const file = await downloadImage(url);
-    if (!file) continue;
+    if (!file) { failed.push(url); continue; }
     const id = randomUUID();
     BLOBS.set(id, file);
     while (BLOBS.size > 20) BLOBS.delete(BLOBS.keys().next().value);
     const ext = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp', 'image/bmp': 'bmp' }[file.type] || 'png';
     images.push({ id, type: file.type, name: `题目图片-${images.length + 1}.${ext}` });
   }
-  return images;
+  return { images, failed };
 }
 
 function normalize(input) {
@@ -277,10 +298,13 @@ export function createServer({ token, monitorIntervalMs = 250, apiSolver = null,
       if (req.headers.authorization !== `Bearer ${token}` && body.token !== token) throw failure(401, 'API_TOKEN 不正确');
       if (requestPath === '/search') {
         const input = normalize(body);
-        const images = await prepareImages([input.question, ...input.options].join(String.fromCharCode(10)));
-        if (images.length) {
-          input.question = stripImageUrls(input.question) || "（题目见图片）";
+        const raw = [input.question, ...input.options].join('\n');
+        const { images, failed } = await prepareImages(raw);
+        if (images.length || failed.length) {
+          // 抓到图就把链接从题干里删掉（页面会把图当文件上传）；没抓到也不留裸链接
+          input.question = stripImageUrls(input.question) || '（本题含图片，未能自动获取）';
           input.options = input.options.map(stripImageUrls);
+          if (failed.length) logger(`${clock(new Date())} ⚠ ${failed.length} 张图片下载失败：${failed[0].slice(0, 120)}`);
         }
         const abort = new AbortController();
         const onClose = () => { if (!res.writableEnded) abort.abort(); };
